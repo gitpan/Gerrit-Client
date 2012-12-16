@@ -3,11 +3,12 @@ abstract: 'interact with Gerrit code review tool'
 author:
   - 'Rohan McGovern <rohan@mcgovern.id.au>'
 build_requires:
-  Capture::Tiny: 0
+  Dir::Self: 0
   Env::Path: 0
   File::chdir: 0
   LWP: 0
   List::MoreUtils: 0
+  Sub::Override: 0
   Test::More: 0
   Test::Warn: 0
 configure_requires:
@@ -25,8 +26,11 @@ no_index:
     - inc
 requires:
   AnyEvent: 0
+  Capture::Tiny: 0
+  Data::Alias: 0
+  File::chdir: 0
   JSON: 0
   Params::Validate: 0
   URI: 0
   perl: 5.01
-version: 20121123
+version: 20121216

@@ -22,11 +22,12 @@
    "prereqs" : {
       "build" : {
          "requires" : {
-            "Capture::Tiny" : "0",
+            "Dir::Self" : "0",
             "Env::Path" : "0",
             "File::chdir" : "0",
             "LWP" : "0",
             "List::MoreUtils" : "0",
+            "Sub::Override" : "0",
             "Test::More" : "0",
             "Test::Warn" : "0"
          }
@@ -39,6 +40,9 @@
       "runtime" : {
          "requires" : {
             "AnyEvent" : "0",
+            "Capture::Tiny" : "0",
+            "Data::Alias" : "0",
+            "File::chdir" : "0",
             "JSON" : "0",
             "Params::Validate" : "0",
             "URI" : "0",
@@ -47,5 +51,5 @@
       }
    },
    "release_status" : "stable",
-   "version" : "20121123"
+   "version" : "20121216"
 }

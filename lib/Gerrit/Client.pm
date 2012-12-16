@@ -34,7 +34,7 @@ Gerrit::Client - interact with Gerrit code review tool
   my $stream = stream_events(
     url => 'ssh://gerrit.example.com:29418',
     on_event => sub {
-      my (undef, $event) = @_;
+      my ($event) = @_;
       if ($event->{type} eq 'patchset-added'
           && $event->{change}{project} eq 'myproject') {
         system("xmessage", "New patch set arrived!");
@@ -59,23 +59,41 @@ use warnings;
 use AnyEvent::Handle;
 use AnyEvent::Util;
 use AnyEvent;
+use Capture::Tiny qw(capture);
 use Carp;
+use Data::Alias;
+use Data::Dumper;
 use English qw(-no_match_vars);
+use File::Path;
+use File::Spec::Functions;
+use File::Temp;
+use File::chdir;
+use JSON;
 use Params::Validate qw(:all);
 use Scalar::Util qw(weaken);
 use URI;
 
 use base 'Exporter';
 our @EXPORT_OK = qw(
+  for_each_patchset
   stream_events
   git_environment
   next_change_id
   random_change_id
   review
+  query
+  quote
 );
 
+our @GIT     = ('git');
 our @SSH     = ('ssh');
-our $VERSION = 20121123;
+our $VERSION = 20121216;
+our $DEBUG   = !!$ENV{GERRIT_CLIENT_DEBUG};
+
+sub _debug_print {
+  return unless $DEBUG;
+  print STDERR __PACKAGE__ . ': ', @_, "\n";
+}
 
 # parses a gerrit URL and returns a hashref with following keys:
 #   cmd => arrayref, base ssh command for interacting with gerrit
@@ -111,14 +129,14 @@ sub _gerrit_parse_url {
   };
 }
 
-# quotes an argument to be passed to gerrit, if necessary.
-sub _quote_gerrit_arg {
-  my ($string) = @_;
-  if ( $string !~ m{ } ) {
-    return $string;
-  }
-  $string =~ s{'}{}g;
-  return qq{'$string'};
+# Like qx, but takes a list, so no quoting issues
+sub _safeqx
+{
+  my (@cmd) = @_;
+  my $status;
+  my $output = capture { $status = system(@cmd) };
+  $? = $status;
+  return $output;
 }
 
 =head1 FUNCTIONS
@@ -140,7 +158,7 @@ stream-events handle as their first argument.
 
 =over
 
-=item B<< on_event => $cb->($handle, $data) >>
+=item B<< on_event => $cb->($data) >>
 
 Called when an event has been received.
 $data is a reference to a hash representing the event.
@@ -149,7 +167,7 @@ See L<the Gerrit
 documentation|http://gerrit.googlecode.com/svn/documentation/2.2.1/cmd-stream-events.html>
 for information on the possible events.
 
-=item B<< on_error => $cb->($handle, $error) >>
+=item B<< on_error => $cb->($error) >>
 
 Called when an error occurs in the connection.
 $error is a human-readable string.
@@ -169,13 +187,14 @@ errors.
 =back
 
 =cut
+
 sub stream_events {
   my (%args) = @_;
 
   my $url      = $args{url}      || croak 'missing url argument';
   my $on_event = $args{on_event} || croak 'missing on_event argument';
   my $on_error = $args{on_error} || sub {
-    my ( undef, $error ) = @_;
+    my ( $error ) = @_;
     warn __PACKAGE__ . ": $error\n";
     return 1;
   };
@@ -208,7 +227,7 @@ sub stream_events {
   my $handle_error = sub {
     my ( $handle, $error ) = @_;
     my $retry;
-    eval { $retry = $on_error->( $out_weak, $error ); };
+    eval { $retry = $on_error->( $error ); };
     if ($retry) {
 
       # retry after $sleep seconds only
@@ -241,7 +260,7 @@ sub stream_events {
       }
     );
     $handle->{r_h_stderr} = AnyEvent::Handle->new( fh => $r2, );
-    $handle->{r_h_stderr}->on_error( sub {} );
+    $handle->{r_h_stderr}->on_error( sub { } );
     $handle->{warn_on_stderr} = 1;
 
     # run stream-events with stdout connected to pipe ...
@@ -268,7 +287,7 @@ sub stream_events {
         # every successful read resets sleep period
         $sleep = $INIT_SLEEP;
 
-        $on_event->( $out_weak, $data );
+        $on_event->( $data );
         $h->push_read(%read_req);
       }
     );
@@ -305,6 +324,220 @@ sub stream_events {
   return $out;
 }
 
+=item B<< for_each_patchset(url => $url, workdir => $workdir, ...) >>
+
+Set up a high-level event watcher to invoke a custom callback or
+command for each existing or incoming patch set on Gerrit. This method
+is suitable for performing automated testing or sanity checks on
+incoming patches.
+
+For each patch set, a git repository is set up with the working tree
+and HEAD set to the patch. The callback is invoked with the current
+working directory set to the top level of this git repository.
+
+Returns a guard object. Event processing terminates when the object is
+destroyed.
+
+Options:
+
+=over
+
+=item B<url>
+
+The Gerrit ssh URL, e.g. C<ssh://user@gerrit.example.com:29418/>. Mandatory.
+
+=item B<workdir>
+
+The top-level working directory under which git repositories and other data
+should be stored. Mandatory. Will be created if it does not exist.
+
+The working directory is persistent across runs. Removing the
+directory may cause the processing of patch sets which have already
+been processed.
+
+=item B<< on_patchset => $sub->($change, $patchset) >>
+
+=item B<< on_patchset_fork => $sub->($change, $patchset) >>
+
+=item B<< on_patchset_cmd => $sub->($change, $patchset) | $cmd_ref >>
+
+Callbacks invoked for each patchset. Only one of the above callback
+forms may be used.
+
+=over
+
+=item *
+
+B<on_patchset> invokes a subroutine in the current process. The callback
+is blocking, which means that only one patch may be processed at a
+time. This is the simplest form and is suitable when the processing
+for each patch is expected to be fast or the rate of incoming patches
+is low.
+
+=item *
+
+B<on_patchset_fork> invokes a subroutine in a new child process. The
+child terminates when the callback returns. Multiple patches may be
+handled in parallel.
+
+The caveats which apply to C<AnyEvent::Util::run_cmd> also apply here;
+namely, it is not permitted to run the event loop in the child process.
+
+=item *
+
+B<on_patchset_cmd> runs a command to handle the patch.
+Multiple patches may be handled in parallel.
+
+The argument to B<on_patchset_cmd> may be either a reference to an array
+holding the command and its arguments, or a reference to a subroutine
+which generates and returns an array for the command and its arguments.
+
+=back
+
+All on_patchset callbacks receive B<change> and B<patchset> hashref arguments.
+Note that a change may hold several patchsets.
+
+=item B<< on_error => $sub->($error) >>
+
+Callback invoked when an error occurs. $error is a human-readable error string.
+
+All errors are treated as recoverable. To abort on an error, explicitly undefine
+the loop guard object from within the callback.
+
+By default, a warning message is printed for each error.
+
+=item B<< review => 0 | 1 | 'code-review' | 'verified' | ... >>
+
+If false (the default), patch sets are not automatically reviewed
+(though they may be reviewed explicitly within the B<on_patchset_...>
+callbacks).
+
+If true, any output (stdout or stderr) from the B<on_patchset_...> callback
+will be captured and posted as a review message. If there is no output,
+no message is posted.
+
+If a string is passed, it is construed as a Gerrit approval category
+and a review score will be posted in that category. The score comes
+from the return value of the callback (or exit code in the case of
+B<on_patchset_cmd>).
+
+=item B<< wanted => $sub->( $change, $patchset ) >>
+
+The optional `wanted' subroutine may be used to limit the patch sets processed.
+
+If given, a patchset will only be processed if this callback returns a
+true value. This can be used to avoid git clones of unwanted projects.
+
+For example, patchsets for all Gerrit projects under a 'test/' namespace could
+be excluded from processing by the following:
+
+    wanted => sub { $_[0]->{project} !~ m{^test/} }
+
+=item B<< query => $query | 0 >>
+
+The Gerrit query used to find the initial set of patches to be
+processed.  The query is executed when the loop begins and whenever
+the connection to Gerrit is interrupted, to avoid missed patchsets.
+
+Defaults to "status:open", meaning every open patch will be processed.
+
+Note that the query is not applied to incoming patchsets observed via
+stream-events. The B<wanted> parameter may be used for that case.
+
+If a false value is passed, querying is disabled altogether. This
+means only patchsets arriving while the loop is running will be
+processed.
+
+=back
+
+=cut
+
+sub for_each_patchset {
+  my (%args) = @_;
+
+  $args{url} || croak 'missing url argument';
+       $args{on_patchset}
+    || $args{on_patchset_cmd}
+    || $args{on_patchset_fork}
+    || croak 'missing on_patchset{_cmd,_fork} argument';
+  $args{workdir} || croak 'missing workdir argument';
+  $args{on_error} ||= sub { warn __PACKAGE__, ': ', @_ };
+
+  if (!exists($args{query})) {
+    $args{query} = 'status:open';
+  }
+
+  if ( !-d $args{workdir} ) {
+    mkpath( $args{workdir} );
+  }
+
+  require "Gerrit/Client/ForEach.pm";
+  my $self = bless {}, 'Gerrit::Client::ForEach';
+  $self->{args} = \%args;
+
+  my $weakself = $self;
+  weaken($weakself);
+
+  # stream_events takes care of incoming changes, perform a query to find
+  # existing changes
+  my $do_query = sub {
+    return unless $args{query};
+
+    query(
+      $args{query},
+      url               => $args{url},
+      current_patch_set => 1,
+      on_error          => sub { $args{on_error}->( @_ ) },
+      on_success        => sub {
+        return unless $weakself;
+        my (@results) = @_;
+        foreach my $change (@results) {
+
+          # simulate patch set creation
+          my ($event) = {
+            type     => 'patchset-created',
+            change   => $change,
+            patchSet => delete $change->{currentPatchSet},
+          };
+          $weakself->_handle_for_each_event($event);
+        }
+      },
+    );
+  };
+
+  # Unfortunately, we have no idea how long it takes between starting the
+  # stream-events command and when the streaming of events begins, so if
+  # we query straight away, we could miss some changes which arrive while
+  # stream-events is e.g. still in ssh negotiation.
+  # Therefore, introduce this arbitrary delay between when we start
+  # stream-events and when we'll perform a query.
+  my $query_timer;
+  my $do_query_soon = sub {
+    $query_timer = AE::timer( 4, 0, $do_query );
+  };
+
+  $self->{stream} = Gerrit::Client::stream_events(
+    url      => $args{url},
+    on_event => sub {
+      $weakself->_handle_for_each_event( @_ );
+    },
+    on_error => sub {
+      my ($error) = @_;
+
+      $args{on_error}->( "connection lost: $error, attempting to recover\n" );
+
+      # after a few seconds to allow reconnect, perform the base query again
+      $do_query_soon->();
+
+      return 1;
+    },
+  );
+
+  $do_query_soon->();
+
+  return $self;
+}
+
 =item B<random_change_id>
 
 Returns a random Change-Id (the character 'I' followed by 40
@@ -312,6 +545,7 @@ hexadecimal digits), suitable for usage as the Change-Id field in a
 commit to be pushed to gerrit.
 
 =cut
+
 sub random_change_id {
   return 'I' . sprintf(
 
@@ -348,6 +582,7 @@ If any problems occur while determining the next Change-Id, a warning
 is printed and a random Change-Id is returned.
 
 =cut
+
 sub next_change_id {
   if ( !$ENV{GIT_AUTHOR_NAME} || !$ENV{GIT_AUTHOR_EMAIL} ) {
     carp __PACKAGE__ . ': git environment is not set, using random Change-Id';
@@ -355,8 +590,8 @@ sub next_change_id {
   }
 
   # First preference: change id is the last SHA used by this bot.
-  my $author    = "$ENV{ GIT_AUTHOR_NAME } <$ENV{ GIT_AUTHOR_EMAIL }>";
-  my $change_id = qx(git rev-list -n1 --fixed-strings "--author=$author" HEAD);
+  my $author    = "$ENV{GIT_AUTHOR_NAME} <$ENV{GIT_AUTHOR_EMAIL}>";
+  my $change_id = _safeqx(@GIT, qw(rev-list -n1 --fixed-strings), "--author=$author", 'HEAD');
   if ( my $error = $? ) {
     carp __PACKAGE__ . qq{: no previous commits from "$author" were found};
   }
@@ -367,7 +602,9 @@ sub next_change_id {
   # Second preference: for a stable but random change-id, use hash of the
   # bot name
   if ( !$change_id ) {
-    $change_id = qx(echo "$author" | git hash-object --stdin);
+    my $tempfile = File::Temp->new( 'perl-Gerrit-Client-hash.XXXXXX', TMPDIR => 1, CLEANUP => 1 );
+    $tempfile->printflush( $author );
+    $change_id = _safeqx(@GIT, 'hash-object', "$tempfile");
     if ( my $error = $? ) {
       carp __PACKAGE__ . qq{: git hash-object failed};
     }
@@ -380,7 +617,7 @@ sub next_change_id {
   # This can happen if an author other than ourself has already used the
   # change id.
   if ($change_id) {
-    my $found = qx(git log -n1000 "--grep=I$change_id" HEAD);
+    my $found = _safeqx(@GIT, 'log', '-n1000', "--grep=I$change_id", 'HEAD');
     if ( !$? && $found ) {
       carp __PACKAGE__ . qq{: desired Change-Id $change_id is already used};
       undef $change_id;
@@ -446,11 +683,12 @@ example:
     (system('git add -u *.cpp') == 0)
       || die 'git add failed';
     (system('git', 'commit', '-m', $message) == 0)
-      || die "git commit failed";
+      || die 'git commit failed';
     (system('git push gerrit HEAD:refs/for/master') == 0)
-      || die "git push failed";
+      || die 'git push failed';
 
 =cut
+
 sub git_environment {
   my (%options) = validate(
     @_,
@@ -511,9 +749,9 @@ All other arguments are optional, and include:
 
 =over
 
-=item B<< on_success => $cb->( $commit_or_change ) >>
+=item B<< on_success => $cb->() >>
 
-=item B<< on_error => $cb->( $commit_or_change, $error ) >>
+=item B<< on_error => $cb->( $error ) >>
 
 Callbacks invoked when the operation succeeds or fails.
 
@@ -547,6 +785,7 @@ on the given site.
 =back
 
 =cut
+
 sub review {
   my $commit_or_change = shift;
   my (%options) = validate(
@@ -556,8 +795,7 @@ sub review {
       on_error   => {
         type    => CODEREF,
         default => sub {
-          my ( $c, @rest ) = @_;
-          warn __PACKAGE__ . "::review: error (for $c): ", @rest;
+          warn __PACKAGE__ . "::review: error: ", @_;
           }
       },
       %GERRIT_REVIEW_OPTIONS,
@@ -570,6 +808,9 @@ sub review {
   # project can be filled in by explicit 'project' argument, or from
   # URL, or left blank
   $options{project} ||= $parsed_url->{project};
+  if (!$options{project}) {
+    delete $options{project};
+  }
 
   while ( my ( $key, $spec ) = each %GERRIT_REVIEW_OPTIONS ) {
     my $value = $options{$key};
@@ -585,7 +826,7 @@ sub review {
       }
     }
     elsif ( defined($value) ) {
-      push @cmd, $cmd_key, _quote_gerrit_arg($value);
+      push @cmd, $cmd_key, quote($value);
     }
   }
 
@@ -602,10 +843,10 @@ sub review {
       my $status = shift->recv();
       if ( $status && $options{on_error} ) {
         $options{on_error}
-          ->( $commit_or_change, "$cmdstr exited with status $status" );
+          ->( "$cmdstr exited with status $status" );
       }
       if ( !$status && $options{on_success} ) {
-        $options{on_success}->($commit_or_change);
+        $options{on_success}->();
       }
 
       # make sure we stay alive until this callback is executed
@@ -614,6 +855,179 @@ sub review {
   );
 
   return;
+}
+
+# options to Gerrit::Client::query which map directly to options to
+# "ssh <somegerrit> gerrit query ..."
+my %GERRIT_QUERY_OPTIONS = (
+  ( map { $_ => { type => BOOLEAN, default => 0 } } qw(
+    all_approvals
+    comments
+    commit_message
+    current_patch_set
+    dependencies
+    files
+    patch_sets
+    submit_records
+  ))
+);
+
+=item B<< query $query, url => $gerrit_url, ... >>
+
+Wrapper for the `gerrit query' command; send a query to gerrit
+and invoke a callback with the results.
+
+$query is the Gerrit query string, whose format is described in L<the
+Gerrit
+documentation|https://gerrit.googlecode.com/svn/documentation/2.2.1/user-search.html>.
+"status:open age:1w" is an example of a simple Gerrit query.
+
+$url is the URL with ssh schema of the Gerrit site to be queried
+(e.g. "ssh://user@gerrit.example.com:29418/").
+If the URL contains a path (project) component, it is ignored.
+
+All other arguments are optional, and include:
+
+=over
+
+=item B<< on_success => $cb->( @results ) >>
+
+Callback invoked when the query completes.
+
+Each element of @results is a hashref representing a Gerrit change,
+parsed from the JSON output of `gerrit query'. The format of Gerrit
+change objects is described in L<the Gerrit documentation|
+https://gerrit.googlecode.com/svn/documentation/2.2.1/json.html>.
+
+=item B<< on_error => $cb->( $error ) >>
+
+Callback invoked when the query command fails.
+$error is a human-readable string describing the error.
+
+=item B<< all_approvals => 0|1 >>
+
+=item B<< comments => 0|1 >>
+
+=item B<< commit_message => 0|1 >>
+
+=item B<< current_patch_set => 0|1 >>
+
+=item B<< dependencies => 0|1 >>
+
+=item B<< files => 0|1 >>
+
+=item B<< patch_sets => 0|1 >>
+
+=item B<< submit_records => 0|1 >>
+
+These options are passed to the `gerrit query' command and may be used
+to increase the level of information returned by the query.
+For information on their usage, please see the output of `gerrit query
+--help' on your gerrit installation, or see L<the Gerrit
+documentation|http://gerrit.googlecode.com/svn/documentation/2.2.1/cmd-query.html>.
+
+=back
+
+=cut
+
+sub query
+{
+  my $query = shift;
+  my (%options) = validate(
+    @_,
+    { url        => 1,
+      on_success => { type => CODEREF, default => undef },
+      on_error   => {
+        type    => CODEREF,
+        default => sub {
+          warn __PACKAGE__ . "::query: error: ", @_;
+          }
+      },
+      %GERRIT_QUERY_OPTIONS,
+    }
+  );
+
+  my $parsed_url = _gerrit_parse_url( $options{url} );
+  my @cmd = ( @{ $parsed_url->{cmd} }, 'query', '--format', 'json' );
+
+  while ( my ( $key, $spec ) = each %GERRIT_QUERY_OPTIONS ) {
+    my $value = $options{$key};
+    next unless $value;
+
+    # some_option -> --some-option
+    my $cmd_key = $key;
+    $cmd_key =~ s{_}{-}g;
+    $cmd_key = "--$cmd_key";
+
+    push @cmd, $cmd_key;
+  }
+
+  push @cmd, quote( $query );
+
+  my $output;
+  my $cv = AnyEvent::Util::run_cmd( \@cmd, '>' => \$output );
+
+  my $cmdstr;
+  {
+    local $LIST_SEPARATOR = '] [';
+    $cmdstr = "[@cmd]";
+  }
+
+  $cv->cb(
+    sub {
+      # make sure we stay alive until this callback is executed
+      undef $cv;
+
+      my $status = shift->recv();
+      if ( $status && $options{on_error} ) {
+        $options{on_error}
+          ->( "$cmdstr exited with status $status" );
+        return;
+      }
+
+      return unless $options{on_success};
+
+      my @results;
+      foreach my $line (split /\n/, $output) {
+        my $data = eval { decode_json($line) };
+        if ($EVAL_ERROR) {
+          $options{on_error}->( "error parsing result `$line': $EVAL_ERROR" );
+          return;
+        }
+        next if ($data->{type} && $data->{type} eq 'stats');
+        push @results, $data;
+      }
+
+      $options{on_success}->(@results);
+      return;
+    }
+  );
+
+  return;
+}
+
+=item B<< quote $string >>
+
+Returns a copy of the input string with special characters escaped, suitable
+for usage with Gerrit CLI commands.
+
+Gerrit commands run via ssh typically need extra quoting because the ssh layer
+already evaluates the command string prior to passing it to Gerrit.
+This function understands how to quote arguments for this case.
+
+B<Note:> do not use this function for passing arguments to other Gerrit::Client
+functions; those perform appropriate quoting internally.
+
+=cut
+
+sub quote {
+  my ($string) = @_;
+
+  # character set comes from gerrit source:
+  # gerrit-sshd/src/main/java/com/google/gerrit/sshd/CommandFactoryProvider.java
+  # 'split' function
+  $string =~ s{([\t "'\\])}{\\$1}g;
+  return $string;
 }
 
 =back
@@ -633,6 +1047,23 @@ ssh.
 
 The default value is C<('ssh')>.
 
+=item B<@Gerrit::Client::GIT>
+
+The git command and initial arguments used when Gerrit::Client invokes
+git.
+
+  # use a local object cache to speed up initial clones
+  local @Gerrit::Client::GIT = ('env', "GIT_ALTERNATE_OBJECT_DIRECTORIES=$ENV{HOME}/gitcache", 'git');
+  my $guard = Gerrit::Client::for_each_patchset ...
+
+The default value is C<('git')>.
+
+=item B<$Gerrit::Client::DEBUG>
+
+If set to a true value, various debugging messages will be printed to
+standard error.  May be set by the GERRIT_CLIENT_DEBUG environment
+variable.
+
 =back
 
 =head1 AUTHOR
@@ -642,6 +1073,9 @@ Rohan McGovern, <rohan@mcgovern.id.au>
 =head1 BUGS
 
 Please use L<http://rt.cpan.org/> to view or report bugs.
+
+When reporting a reproducible bug, please include the output of your
+program with the environment variable GERRIT_CLIENT_DEBUG set to 1.
 
 =head1 LICENSE AND COPYRIGHT
 
