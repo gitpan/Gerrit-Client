@@ -33,6 +33,21 @@ use File::chdir;
 use Gerrit::Client;
 use Scalar::Util qw(weaken);
 
+# counter of how many connections we have per server
+my %CONNECTION_COUNTER;
+
+# counter of how many worker processes we have
+my $WORKER_COUNTER;
+
+# 1 when fetching into a gitdir
+my %GITDIR_FETCHING;
+
+sub _giturl_counter {
+  my ($giturl) = @_;
+  my $gerriturl = Gerrit::Client::_gerrit_parse_url($giturl)->{gerrit};
+  return \$CONNECTION_COUNTER{$gerriturl};
+}
+
 sub _debug_print {
   return Gerrit::Client::_debug_print(@_);
 }
@@ -50,7 +65,7 @@ sub _handle_for_each_event {
 
   $self->_enqueue_event($event);
 
-  return $self->_dequeue();
+  return $self->_dequeue_soon();
 }
 
 # Git command generators; these are methods so that they can be
@@ -69,14 +84,30 @@ sub _git_clone_cmd
 
 sub _git_fetch_cmd
 {
-  my (undef, $giturl, $gitdir, $ref) = @_;
-  return (@Gerrit::Client::GIT, '--git-dir', $gitdir, 'fetch', '-v', $giturl, "+$ref:$ref");
+  my (undef, $giturl, $gitdir, @refs) = @_;
+  return (@Gerrit::Client::GIT, '--git-dir', $gitdir, 'fetch', '-v', $giturl,
+          (map { "+$_:$_" } @refs));
 }
 
 sub _git_reset_cmd
 {
-  my (undef, $ref) = @_;
-  return (@Gerrit::Client::GIT, 'reset', '--hard', $ref);
+  my (undef, $ref, $mode) = @_;
+  $mode ||= '--hard';
+  return (@Gerrit::Client::GIT, 'reset', $mode, $ref);
+}
+
+# Returns 1 iff $gitdir contains the given $ref
+sub _have_ref {
+  my ($gitdir, $ref) = @_;
+  my $status;
+  capture_merged {
+    $status = system(
+      @Gerrit::Client::GIT,
+      '--git-dir',             $gitdir,
+      'rev-parse', $ref
+    );
+  };
+  return ($status == 0);
 }
 
 # Returns 1 iff it appears the revision for $event has already been handled
@@ -172,6 +203,7 @@ sub _ensure_git_cloned {
     name  => 'git clone',
     cmd => [ $self->_git_bare_clone_cmd( $giturl, $gitdir ) ],
     onlyif => sub { !-d $gitdir },
+    counter => [ _giturl_counter($giturl), $Gerrit::Client::MAX_CONNECTIONS ],
   );
   return unless $cloned;
 
@@ -179,9 +211,7 @@ sub _ensure_git_cloned {
     $self->{git_cloned}{$gitdir} = 1;
 
     # make sure to wake up any other event who was waiting on the clone
-    my $weakself = $self;
-    weaken($weakself);
-    AE::postpone { $weakself && $weakself->_dequeue() };
+    $self->_dequeue_soon();
   }
 
   if ( !-d $gitdir ) {
@@ -194,18 +224,32 @@ sub _ensure_git_cloned {
 }
 
 sub _ensure_git_fetched {
-  my ( $self, $event, $out ) = @_;
+  my ( $self, $event, $out, $in ) = @_;
 
   my $gitdir = $self->_gitdir($event);
   my $giturl = $self->_giturl($event);
   my $ref    = $event->{patchSet}{ref};
 
+  if ($event->{_have_ref} || _have_ref($gitdir, $ref)) {
+    $event->{_have_ref} ||= 1;
+    return 1;
+  }
+
+  # If we're running a 'git fetch', we should try to find
+  # _all_ needed refs for the given giturl and fetch them at once
+  my @refs = map {
+    ($self->_giturl($_) eq $giturl) ? ($_->{patchSet}{ref}) : ()
+  } @{$in};
+
   return $self->_ensure_cmd(
     event => $event,
     queue => $out,
     name  => 'git fetch',
+    counter => [ _giturl_counter($giturl), $Gerrit::Client::MAX_CONNECTIONS ],
+    'lock' => \$GITDIR_FETCHING{$gitdir},
+    onlyif => sub { !_have_ref( $gitdir, $ref ) },
     cmd =>
-      [ $self->_git_fetch_cmd( $giturl, $gitdir, $ref ) ],
+      [ $self->_git_fetch_cmd( $giturl, $gitdir, $ref, @refs ) ],
   );
 }
 
@@ -217,16 +261,28 @@ sub _ensure_git_workdir_uptodate {
   my $gitdir  = $self->_gitdir($event);
 
   alias my $workdir = $event->{_workdir};
+
+  # avoid creating temporary directory etc if we can't run processes yet
+  if (!$workdir && ($WORKER_COUNTER||0) >= $Gerrit::Client::MAX_FORKS) {
+    push @{$out}, $event;
+    return;
+  }
+
   $workdir ||=
     File::Temp->newdir("$self->{args}{workdir}/$project/work.XXXXXX");
+
+  my $bare = !$self->{args}{git_work_tree};
 
   return
     unless $self->_ensure_cmd(
     event => $event,
     queue => $out,
     name  => 'git clone for workdir',
-    cmd => [ $self->_git_clone_cmd( $gitdir, $workdir ) ],
-    onlyif => sub { !-d "$workdir/.git" },
+    cmd => [ $bare
+               ? $self->_git_bare_clone_cmd( $gitdir, $workdir )
+               : $self->_git_clone_cmd( $gitdir, $workdir ) ],
+    onlyif => sub { !-d( $bare ? "$workdir/objects" : "$workdir/.git") },
+    counter => [ \$WORKER_COUNTER, $Gerrit::Client::MAX_FORKS ],
     );
 
   return
@@ -234,16 +290,18 @@ sub _ensure_git_workdir_uptodate {
     event => $event,
     queue => $out,
     name  => 'git fetch for workdir',
-    cmd => [ $self->_git_fetch_cmd( 'origin', "$workdir/.git", $ref ) ],
+    cmd => [ $self->_git_fetch_cmd( 'origin', $bare ? $workdir : "$workdir/.git", $ref ) ],
     wd    => $workdir,
+    counter => [ \$WORKER_COUNTER, $Gerrit::Client::MAX_FORKS ],
   );
 
   return $self->_ensure_cmd(
     event => $event,
     queue => $out,
     name  => 'git reset for workdir',
-    cmd => [ $self->_git_reset_cmd( $ref ) ],
+    cmd => [ $self->_git_reset_cmd( $ref, $bare ? '--soft' : '--hard' ) ],
     wd    => $workdir,
+    counter => [ \$WORKER_COUNTER, $Gerrit::Client::MAX_FORKS ],
   );
 }
 
@@ -254,7 +312,7 @@ sub _ensure_cmd {
   my $name  = $args{name};
 
   # capture output by default so that we can include it in error messages
-  if (!exists($args{saveoutput})) {
+  if ( !exists( $args{saveoutput} ) ) {
     $args{saveoutput} = 1;
   }
 
@@ -287,6 +345,34 @@ sub _ensure_cmd {
       return 1;
     }
 
+    # Don't run the command if it counts as a connection and we'd have
+    # too many
+    my ($counter, $count_max) = @{ $args{counter} || [] };
+    my $uncounter;
+    if ($counter) {
+      if ( ($$counter||0) >= $count_max ) {
+        _debug_print(
+          "$cmdstr: delaying execution, would surpass limit\n");
+        push @{$queue}, $event;
+        return;
+      }
+      $$counter++;
+      $uncounter = guard { $$counter-- };
+    }
+
+    my $lock = $args{lock};
+    my $unlock;
+    if ($lock) {
+      if ($$lock) {
+        _debug_print(
+          "$cmdstr: delaying execution, lock held elsewhere\n");
+        push @{$queue}, $event;
+        return;
+      }
+      $$lock++;
+      $unlock = guard { $$lock-- };
+    }
+
     my $printoutput = sub { _debug_print( "$cmdstr: ", @_ ) };
     my $handleoutput = $printoutput;
 
@@ -312,19 +398,20 @@ sub _ensure_cmd {
     $cmdcv->cb(
       sub {
         my ($cv) = @_;
+        undef $uncounter;
+        undef $unlock;
         return unless $weakself;
 
         my $status = $cv->recv();
         if ( $status && !$args{allownonzero} ) {
-          $self->{args}{on_error}
-            ->( "$name exited with status $status\n"
-                  . ($event->{$outputkey} ? $event->{$outputkey} : q{}));
+          $self->{args}{on_error}->( "$name exited with status $status\n"
+              . ( $event->{$outputkey} ? $event->{$outputkey} : q{} ) );
         }
         else {
           $event->{$donekey} = 1;
         }
         $event->{$statuskey} = $status;
-        $weakself->_dequeue();
+        $weakself->_dequeue_soon();
       }
     );
     push @{$queue}, $event;
@@ -336,8 +423,7 @@ sub _ensure_cmd {
     return;
   }
 
-  $self->{args}{on_error}
-    ->( "dropped event due to failed command: $cmdstr\n" );
+  $self->{args}{on_error}->("dropped event due to failed command: $cmdstr\n");
   return;
 }
 
@@ -396,7 +482,7 @@ sub _do_cb_forksub {
         }
       }
       $event->{_forksub_result} = $result;
-      $weakself->_dequeue();
+      $weakself->_dequeue_soon();
     }
   );
   push @{$queue}, $event;
@@ -428,6 +514,7 @@ sub _do_cb_cmd {
     wd    => $event->{_workdir},
     saveoutput => $self->{args}{review},
     allownonzero => 1,
+    counter => [ \$WORKER_COUNTER, $Gerrit::Client::MAX_FORKS ],
   );
 
   my $score = 0;
@@ -474,30 +561,51 @@ sub _do_callback {
   return unless $result;
 
   if ($Gerrit::Client::DEBUG) {
-    _debug_print 'callback result: '.Dumper($result);
+    _debug_print 'callback result: ' . Dumper($result);
   }
 
   # Ensure we shan't review it again
-  $self->_mark_commit_reviewed( $event );
+  $self->_mark_commit_reviewed($event);
 
   my $review = $self->{args}{review};
   return unless $review;
 
-  if ($review =~ m{\A\d+\z}) {
+  if ( $review =~ m{\A\d+\z} ) {
     $review = 'code_review';
   }
 
-  if (!$result->{output} && !$result->{score}) {
+  if ( my $cb = $self->{args}{on_review} ) {
+    return
+      unless $cb->(
+      $event->{change},  $event->{patchSet},
+      $result->{output}, $result->{score}
+      );
+  }
+
+  if ( !$result->{output} && !$result->{score} ) {
     # no review to be done
     return;
   }
 
   Gerrit::Client::review(
     $event->{patchSet}{revision},
-    url => $self->{args}{url},
+    url     => $self->{args}{url},
     message => $result->{output},
     $review => $result->{score},
   );
+}
+
+sub _dequeue_soon {
+  my ($self) = @_;
+  my $weakself = $self;
+  weaken($weakself);
+  $self->{_dequeue_timer} ||= AE::timer( .1, 0,
+                                         sub {
+                                           return unless $weakself;
+                                           delete $weakself->{_dequeue_timer};
+                                           $weakself->_dequeue();
+                                         }
+                                       );
 }
 
 sub _dequeue {
@@ -510,10 +618,11 @@ sub _dequeue {
   my $weakself = $self;
   weaken($weakself);
 
+  my @queue = @{ $self->{queue} || [] };
   my @newqueue;
-  foreach my $event ( @{ $self->{queue} || [] } ) {
+  while (my $event = shift @queue) {
     next unless $self->_ensure_git_cloned( $event, \@newqueue );
-    next unless $self->_ensure_git_fetched( $event, \@newqueue );
+    next unless $self->_ensure_git_fetched( $event, \@newqueue, \@queue );
     next unless $self->_ensure_git_workdir_uptodate( $event, \@newqueue );
     $self->_do_callback( $event, \@newqueue );
   }
