@@ -13,11 +13,11 @@ use Test::More;
 sub test_patchset_creation {
   my ($gerrit)    = @_;
   my $giturl_base = $gerrit->giturl_base();
-  my $giturl      = "$giturl_base/perl-gerrit-client-test";
+  my $giturl      = "$giturl_base/rest/perl-gerrit-client-test";
 
   if ( $gerrit->git( 'ls-remote', $giturl ) ) {
     $gerrit->gerrit_ok( 'create-project', '--empty-commit',
-      'perl-gerrit-client-test' )
+      'rest/perl-gerrit-client-test' )
       || return;
   }
 
@@ -45,7 +45,7 @@ sub test_patchset_creation {
 
   my $pushed       = 0;
   my $stop_count   = scalar @exist;
-  my $review_score = 0;
+  my $review_value;
   my $review_output;
   my @events;
   my %review_events;
@@ -62,7 +62,10 @@ sub test_patchset_creation {
     }
   );
   my $guard = Gerrit::Client::for_each_patchset(
-    url         => $giturl_base,
+    ssh_url     => $giturl_base,
+    http_url    => $gerrit->http_url(),
+    http_username => 'perl-gerrit-client-test',
+    http_password => 'abcdefghijkl',
     workdir     => "$workdir",
     review      => 1,
     on_patchset => sub {
@@ -80,7 +83,7 @@ sub test_patchset_creation {
       if ($review_output) {
         print $review_output;
       }
-      return $review_score;
+      return $review_value;
     },
   );
 
@@ -93,6 +96,7 @@ sub test_patchset_creation {
     $cv = AE::cv();
   }
 
+  # no output or value - nothing should happen
   my $commit1;
   {
     $gerrit->git_test_commit(
@@ -107,6 +111,7 @@ sub test_patchset_creation {
     $cv = AE::cv();
   }
 
+  # output and ReviewInput - should review by REST
   my $commit2;
   {
     $gerrit->git_test_commit( { amend => 1 } ) || return;
@@ -116,27 +121,30 @@ sub test_patchset_creation {
     $pushed = $commit2;
     ++$stop_count;
     $review_output = 'review of commit 2';
-    $review_score  = -1;
+    $review_value = {
+      message => 'review of commit 2 via REST',
+      labels => {'Code-Review' => +1},
+      comments => {
+        'testfile' => [{line => 1, message => 'testfile line 1 looks bad'}]
+      }
+    };
     $cv->recv();
     $cv = AE::cv();
   }
 
-  # if we kill ssh and push another commit immediately after, we should still
-  # be able to find that new commit (perhaps with some delay)
+  # output and a bad ReviewInput - should try REST, then fallback to ssh
   my $commit3;
   {
-    $gerrit->git_test_commit(
-      "commit 3\n\nChange-Id: " . Gerrit::Client::random_change_id() )
-      || return;
+    $gerrit->git_test_commit( { amend => 1 } ) || return;
     $commit3 = qx(git rev-parse HEAD);
     chomp $commit3;
-    diag "'connection lost' warnings may be printed, don't be alarmed, this is expected...";
-    is( kill( 15, $ssh_pid ), 1, 'killed ssh' );
     $gerrit->git_ok( 'push', '-v', 'origin', 'HEAD:refs/for/master' ) || return;
     $pushed = $commit3;
     ++$stop_count;
     $review_output = 'review of commit 3';
-    $review_score  = 0;
+    $review_value = {
+      something => 'invalid',
+    };
     $cv->recv();
     $cv = AE::cv();
   }
@@ -178,8 +186,9 @@ sub test_patchset_creation {
     qr{
       \A
       # this prefix appears on some gerrit versions
-      (Patch\ Set\ 2:\ Code-Review-1\s+)?
-      review\ of\ commit\ 2
+      (Patch\ Set\ 2:\ Code-Review\+1\s+)?
+      \(1\ comment\)\s+
+      \Qreview of commit 2 via REST\E
       \z
     }xms,
     'commit 2 review message'
@@ -188,7 +197,7 @@ sub test_patchset_creation {
     $review_events{$commit2}{approvals}[0],
     { 'description' => $description,
       'type'        => $type,
-      'value'       => '-1'
+      'value'       => 1,
     },
     'commit 2 review score'
   );
@@ -197,7 +206,7 @@ sub test_patchset_creation {
     $review_events{$commit3}{comment},
     qr{
       \A
-      (Patch\ Set\ 1:\s+)?
+      (Patch\ Set\ 3:\s+)?
       review\ of\ commit\ 3
       \z
     }xms,

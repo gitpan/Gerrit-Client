@@ -4,9 +4,9 @@
       "Rohan McGovern <rohan@mcgovern.id.au>"
    ],
    "dynamic_config" : 1,
-   "generated_by" : "ExtUtils::MakeMaker version 6.6302, CPAN::Meta::Converter version 2.120921",
+   "generated_by" : "ExtUtils::MakeMaker version 6.92, CPAN::Meta::Converter version 2.141520",
    "license" : [
-      "unknown"
+      "lgpl_2_1"
    ],
    "meta-spec" : {
       "url" : "http://search.cpan.org/perldoc?CPAN::Meta::Spec",
@@ -22,6 +22,7 @@
    "prereqs" : {
       "build" : {
          "requires" : {
+            "Archive::Zip" : "0",
             "Dir::Self" : "0",
             "Env::Path" : "0",
             "File::chdir" : "0",
@@ -29,7 +30,8 @@
             "List::MoreUtils" : "0",
             "Sub::Override" : "0",
             "Test::More" : "0",
-            "Test::Warn" : "0"
+            "Test::Warn" : "0",
+            "autodie" : "0"
          }
       },
       "configure" : {
@@ -40,6 +42,7 @@
       "runtime" : {
          "requires" : {
             "AnyEvent" : "0",
+            "AnyEvent::HTTP" : "0",
             "Capture::Tiny" : "0",
             "Data::Alias" : "0",
             "File::chdir" : "0",
@@ -51,5 +54,5 @@
       }
    },
    "release_status" : "stable",
-   "version" : "20121218"
+   "version" : "20140609"
 }
