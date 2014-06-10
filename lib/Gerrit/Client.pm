@@ -90,7 +90,7 @@ our @EXPORT_OK = qw(
 
 our @GIT             = ('git');
 our @SSH             = ('ssh');
-our $VERSION         = 20140609;
+our $VERSION         = 20140610;
 our $DEBUG           = !!$ENV{GERRIT_CLIENT_DEBUG};
 our $MAX_CONNECTIONS = 2;
 our $MAX_FORKS       = 4;
@@ -295,8 +295,8 @@ sub stream_events {
         # every successful read resets sleep period
         $sleep = $INIT_SLEEP;
 
-        $on_event->($data);
         $h->push_read(%read_req);
+        $on_event->($data);
       }
     );
     $handle->{r_h}->push_read(%read_req);

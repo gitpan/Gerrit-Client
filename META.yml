@@ -36,4 +36,4 @@ requires:
   Params::Validate: '0'
   URI: '0'
   perl: '5.01'
-version: '20140609'
+version: '20140610'
