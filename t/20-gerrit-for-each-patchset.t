@@ -6,6 +6,7 @@ use AnyEvent;
 use AnyEvent::Socket;
 use AnyEvent::Handle;
 use AnyEvent::Util;
+use Config;
 use Data::Dumper;
 use Dir::Self;
 use English qw( -no_match_vars );
@@ -261,7 +262,7 @@ sub test_for_each_patchset {
   my @events;
 
   # make sure we eventually give up if something goes wrong
-  my $timeout_timer = AE::timer( 120, 0, sub { $cv->croak("timed out after $#events event(s)") } );
+  my $timeout_timer = AE::timer( 120, 0, sub { my $cnt = @events; $cv->croak("timed out after $cnt event(s)") } );
   my $done_timer;
   my $guard;
 
@@ -366,10 +367,13 @@ sub test_for_each_patchset_cmd {
   }, sub {
     my (undef, undef, $port) = @_;
     $ENV{TEST_SOCKET_PORT} = $port;
+    return 0;
   };
 
-  test_for_each_patchset( 'cmd',
-    on_patchset_cmd => [ 'perl', $script, 'record_event' ] );
+  my @cmd = ($Config{perlpath}, $script, 'record_event');
+  diag "patchset command: @cmd";
+
+  test_for_each_patchset( 'cmd', on_patchset_cmd => \@cmd );
 }
 
 sub record_event_from_child {
